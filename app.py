@@ -17,6 +17,15 @@ from datetime import datetime
 from config import Config
 from utils import SimpleCache, format_answer_for_ocs, parse_question_and_options, extract_answer
 
+# Exa搜索SDK
+try:
+    from exa_py import Exa
+    EXA_AVAILABLE = True
+except ImportError:
+    EXA_AVAILABLE = False
+    logger = logging.getLogger('ai_answer_service')
+    logger.warning("exa-py 未安装，联网搜索功能不可用。请运行: pip install exa-py")
+
 # 配置日志
 logging.basicConfig(
     level=getattr(logging, Config.LOG_LEVEL),
@@ -42,6 +51,17 @@ client = openai.OpenAI(
     base_url=Config.OPENAI_API_BASE
 )
 
+# 初始化Exa搜索客户端
+exa_client = None
+if Config.EXA_ENABLED and EXA_AVAILABLE:
+    if Config.EXA_API_KEY:
+        exa_client = Exa(api_key=Config.EXA_API_KEY)
+        logger.info("Exa搜索服务已启用")
+    else:
+        logger.warning("Exa已启用但未设置EXA_API_KEY，联网搜索功能不可用")
+elif Config.EXA_ENABLED and not EXA_AVAILABLE:
+    logger.warning("exa-py库未安装，联网搜索功能不可用")
+
 # 问答记录存储（实际应用中可以使用数据库）
 qa_records = []
 MAX_RECORDS = 100  # 最多保存100条记录
@@ -54,6 +74,151 @@ def verify_access_token(request):
         if not token or token != Config.ACCESS_TOKEN:
             return False
     return True
+
+
+def refine_search_query(question: str, question_type: str, options: str) -> str:
+    """
+    步骤1: 使用模型整理问题，生成适合搜索的关键词
+    
+    Args:
+        question: 原始问题
+        question_type: 问题类型
+        options: 选项内容
+        
+    Returns:
+        str: 优化后的搜索查询关键词
+    """
+    type_names = {
+        "single": "单选题",
+        "multiple": "多选题",
+        "judgement": "判断题",
+        "completion": "填空题"
+    }
+    type_name = type_names.get(question_type, "题目")
+    
+    refine_prompt = f"""你是一个搜索查询优化专家。请根据下面的{type_name}，提取出最适合在搜索引擎中查找答案的关键词。
+
+题目: {question}
+"""
+    if options:
+        refine_prompt += f"选项: {options}\n"
+    refine_prompt += """
+请只输出关键词，不要解释，不要有多余的文字。关键词要简洁精准，便于在搜索引擎中查找答案。"""
+
+    try:
+        response = client.chat.completions.create(
+            model=Config.OPENAI_MODEL,
+            temperature=0.3,
+            max_tokens=100,
+            messages=[
+                {"role": "system", "content": "你是一个搜索查询优化专家，只输出搜索关键词。"},
+                {"role": "user", "content": refine_prompt}
+            ]
+        )
+        query = response.choices[0].message.content.strip()
+        logger.info(f"搜索关键词: '{query}'")
+        return query
+    except Exception as e:
+        logger.warning(f"关键词提炼失败，使用原始问题: {e}")
+        return question
+
+
+def exa_search(query: str) -> str:
+    """
+    步骤2: 调用Exa搜索，获取相关网页内容
+    
+    Args:
+        query: 搜索查询关键词
+        
+    Returns:
+        str: 格式化的搜索结果文本
+    """
+    if not exa_client:
+        logger.warning("Exa客户端不可用，跳过联网搜索")
+        return ""
+    
+    try:
+        result = exa_client.search(
+            query,
+            type=Config.EXA_SEARCH_TYPE,
+            num_results=Config.EXA_NUM_RESULTS,
+            contents={"text": {"maxCharacters": 3000}}
+        )
+        
+        if not result.results:
+            logger.info("Exa搜索无结果")
+            return ""
+        
+        # 格式化搜索结果
+        search_text_parts = []
+        for i, r in enumerate(result.results, 1):
+            title = r.title or "无标题"
+            url = r.url or ""
+            text = getattr(r, 'text', None) or ""
+            if text:
+                # 截断过长的文本
+                text = text[:2000] if len(text) > 2000 else text
+            search_text_parts.append(f"[来源{i}] 标题: {title}\nURL: {url}\n内容: {text}\n")
+        
+        search_text = "\n---\n".join(search_text_parts)
+        logger.info(f"Exa搜索返回 {len(result.results)} 条结果")
+        return search_text
+    
+    except Exception as e:
+        logger.error(f"Exa搜索失败: {e}", exc_info=True)
+        return ""
+
+
+def build_answer_prompt(question: str, question_type: str, options: str, search_context: str) -> str:
+    """
+    步骤3: 将Exa搜索结果放入提示词，构建最终的回答提示
+    
+    Args:
+        question: 原始问题
+        question_type: 问题类型
+        options: 选项内容
+        search_context: Exa搜索得到的上下文
+        
+    Returns:
+        str: 包含搜索上下文的最终提示词
+    """
+    type_names = {
+        "single": "单选题",
+        "multiple": "多选题",
+        "judgement": "判断题",
+        "completion": "填空题"
+    }
+    type_name = type_names.get(question_type, "题目")
+    
+    # 题目类型提示
+    type_prompts = {
+        "single": "这是一道单选题。请根据参考资料选择正确答案，只回答选项的内容(如：地球)。",
+        "multiple": "这是一道多选题。请根据参考资料选择所有正确答案，答案用#号分隔(如中国#世界#地球)。",
+        "judgement": "这是一道判断题。只回答: 正确/对/true/√ 或 错误/错/false/×。",
+        "completion": "这是一道填空题。请根据参考资料直接给出答案。"
+    }
+    
+    prompt = f"""你是一个专业的考试答题助手。请根据以下参考资料回答问题。
+
+## {type_name}
+问题: {question}
+"""
+    if options:
+        prompt += f"选项:\n{options}\n"
+    
+    type_hint = type_prompts.get(question_type, "请直接给出答案，不要解释。")
+    prompt += f"\n{type_hint}\n"
+    
+    if search_context:
+        prompt += f"""
+## 参考资料（来自网络搜索）
+{search_context}
+
+请基于以上参考资料回答问题。如果参考资料中没有相关信息，请根据你的知识回答。"""
+    else:
+        prompt += "\n请根据你的知识回答问题。"
+    
+    return prompt
 
 @app.route('/api/search', methods=['GET', 'POST'])
 def search():
@@ -118,10 +283,26 @@ def search():
                 logger.info(f"从缓存获取答案 (耗时: {time.time() - start_time:.2f}秒)")
                 return jsonify(format_answer_for_ocs(question, cached_answer))
         
-        # 构建发送给OpenAI的提示
-        prompt = parse_question_and_options(question, options, question_type)
+        # === 新工作流程: 模型整理问题 -> exa-py搜索 -> 搜索结果为提示词 -> 模型输出答案 ===
         
-        # 调用OpenAI API
+        # 步骤1: 模型整理问题，生成搜索关键词
+        search_query = refine_search_query(question, question_type, options)
+        step1_time = time.time()
+        logger.info(f"[步骤1] 搜索关键词提炼完成 (耗时: {step1_time - start_time:.2f}秒)")
+        
+        # 步骤2: 调用exa-py搜索
+        search_context = ""
+        if exa_client:
+            search_context = exa_search(search_query)
+            step2_time = time.time()
+            logger.info(f"[步骤2] Exa搜索完成 (耗时: {step2_time - step1_time:.2f}秒)")
+        else:
+            logger.info("[步骤2] Exa不可用，跳过联网搜索")
+        
+        # 步骤3: 将搜索结果放入提示词
+        prompt = build_answer_prompt(question, question_type, options, search_context)
+        
+        # 步骤4: 让模型输出最终答案
         response = client.chat.completions.create(
             model=Config.OPENAI_MODEL,
             temperature=Config.TEMPERATURE,

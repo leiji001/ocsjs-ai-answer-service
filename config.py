@@ -31,6 +31,12 @@ class Config:
     MAX_TOKENS = int(os.getenv("MAX_TOKENS", 500))
     TEMPERATURE = float(os.getenv("TEMPERATURE", 0.7))
     
+    # Exa搜索配置
+    EXA_API_KEY = os.getenv("EXA_API_KEY", None)
+    EXA_ENABLED = os.getenv("EXA_ENABLED", "True").lower() == "true"
+    EXA_NUM_RESULTS = int(os.getenv("EXA_NUM_RESULTS", 5))
+    EXA_SEARCH_TYPE = os.getenv("EXA_SEARCH_TYPE", "auto")  # auto / fast / deep
+    
     # 缓存配置
     ENABLE_CACHE = os.getenv("ENABLE_CACHE", "True").lower() == "true"
     CACHE_EXPIRATION = int(os.getenv("CACHE_EXPIRATION", 86400))  # 默认缓存24小时
